@@ -22,6 +22,13 @@ from typing import Optional
 
 import requests
 
+
+def _clean_name(raw: str) -> str:
+    """Decode HTML entities, strip all kinds of whitespace, return 'Товар' if empty."""
+    name = html_module.unescape(raw or "")
+    name = name.replace("\xa0", " ").replace("\u200b", "").strip()
+    return name if name else "Товар"
+
 logger = logging.getLogger(__name__)
 
 HEADERS = {
@@ -133,92 +140,157 @@ def _inditex_country_locale(url: str) -> tuple[str, str]:
     return "RU", "ru_RU"
 
 
+def _fetch_url(url: str, headers: dict) -> Optional[requests.Response]:
+    """
+    Fetch a URL. If SCRAPER_API_KEY env var is set, route through ScraperAPI
+    which handles Cloudflare and other anti-bot measures automatically.
+    """
+    import os
+    scraper_key = os.environ.get("SCRAPER_API_KEY", "").strip()
+    if scraper_key:
+        proxy_url = f"http://api.scraperapi.com?api_key={scraper_key}&url={urllib.parse.quote(url)}"
+        resp = requests.get(proxy_url, headers=headers, timeout=60)
+    else:
+        resp = requests.get(url, headers=headers, timeout=TIMEOUT)
+    return resp if resp.status_code == 200 else None
+
+
 def scrape_inditex(url: str) -> ScrapeResult:
-    """Fetch product data via Inditex internal JSON API (works for all Inditex brands)."""
+    """
+    Fetch product data from Inditex brands.
+    Strategy (in order):
+      1. api.zara.com — mobile app API, usually not behind Cloudflare
+      2. itxrest/webservices endpoints with mobile User-Agents
+      3. ScraperAPI proxy (if SCRAPER_API_KEY env var is set)
+      4. HTML fallback
+    """
     product_id = _inditex_product_id(url)
     if not product_id:
         return ScrapeResult(error="Не удалось найти ID товара в ссылке.")
 
     country, locale = _inditex_country_locale(url)
     domain = _inditex_domain(url)
+    clean_url = url.split("?")[0]
+    lang = locale.split("_")[0]
 
-    # Use a session: first visit the product page to get cookies,
-    # then call the API — this bypasses 403 anti-bot blocks
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    # ── Strategy 1: Zara mobile app API (different domain, no Cloudflare) ──
+    app_api_candidates = [
+        f"https://api.zara.com/article/v1/articles/{product_id}?country={country}&lang={lang}",
+        f"https://api.zara.com/catalog/v1/product/{product_id}?country={country}&locale={locale}",
+    ]
+    app_ua = "com.inditex.zara/1 CFNetwork/1410.0.3 Darwin/22.6.0"
+    for api_url in app_api_candidates:
+        try:
+            resp = requests.get(
+                api_url,
+                headers={"User-Agent": app_ua, "Accept": "application/json"},
+                timeout=TIMEOUT,
+            )
+            if resp.status_code == 200:
+                candidate = resp.json()
+                if candidate.get("name") or candidate.get("detail") or candidate.get("product"):
+                    logger.info(f"App API success: {api_url}")
+                    return _parse_inditex_data(candidate)
+        except Exception as e:
+            logger.debug(f"App API failed ({api_url}): {e}")
 
-    # Step 1: load the product page to pick up cookies
-    clean_url = url.split("?")[0]  # strip UTM params
-    try:
-        session.get(clean_url, timeout=TIMEOUT, allow_redirects=True)
-    except Exception:
-        pass  # cookies not critical, continue anyway
+    # ── Strategy 2: classic itxrest/webservices with mobile UAs ──
+    api_candidates = [
+        f"https://{domain}/itxrest/3/catalog/store/{country}/{locale}/product/{product_id}/detail",
+        f"https://{domain}/webservices/zds/catalog/store/{country}/{locale}/product/{product_id}/detail",
+    ]
+    user_agents = [
+        "com.inditex.zara/1 CFNetwork/1410.0.3 Darwin/22.6.0",
+        "Zara/12.3.0 (Linux; Android 13; SM-G991B Build/TP1A.220624.014)",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+    ]
+    for ua in user_agents:
+        for api_url in api_candidates:
+            try:
+                resp = _fetch_url(api_url, {
+                    "User-Agent": ua,
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": clean_url,
+                    "Origin": f"https://{domain}",
+                })
+                if resp:
+                    candidate = resp.json()
+                    if candidate.get("name") or candidate.get("detail"):
+                        logger.info(f"Inditex API success: {api_url} | UA: {ua[:40]}")
+                        return _parse_inditex_data(candidate)
+            except Exception as e:
+                logger.debug(f"Attempt failed ({api_url}): {e}")
 
-    # Step 2: call the internal API with cookies + JSON Accept header
-    api_url = (
-        f"https://{domain}/itxrest/3/catalog/store/{country}/{locale}/"
-        f"product/{product_id}/detail"
-    )
-    api_headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Referer": clean_url,
-        "Origin": f"https://{domain}",
-        "X-Requested-With": "XMLHttpRequest",
-    }
+    logger.warning(f"All Inditex API attempts failed for product {product_id}")
+    return _scrape_inditex_html(clean_url)
 
-    try:
-        resp = session.get(api_url, headers=api_headers, timeout=TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        logger.warning(f"Inditex API failed ({api_url}): {e}")
-        # Fallback: try to extract data from embedded page JSON
-        return _scrape_inditex_html(session, clean_url)
 
-    product_name = html_module.unescape(data.get("name", "Товар")).strip()
+def _parse_inditex_data(data: dict) -> ScrapeResult:
+    """Parse size/availability from any Inditex API JSON response."""
+    # Handle nested structures from different API versions
+    product = data.get("product", data)
+    product_name = _clean_name(product.get("name", data.get("name", "")))
 
-    all_sizes = []
-    available_sizes = []
+    all_sizes: list = []
+    available_sizes: list = []
 
-    for detail in data.get("detail", {}).get("colors", []):
+    # Format 1: detail.colors[].sizes[]
+    for detail in product.get("detail", data.get("detail", {})).get("colors", []):
         for size_info in detail.get("sizes", []):
             size_label = size_info.get("name", "").strip()
             if not size_label:
                 continue
             if size_label not in all_sizes:
                 all_sizes.append(size_label)
-
-            # availability: BACK_IN_STOCK, IN_STOCK are available; OUT_OF_STOCK is not
             sku_avail = size_info.get("availability", "")
             if sku_avail in ("IN_STOCK", "BACK_IN_STOCK", "LOW_ON_STOCK"):
                 if size_label not in available_sizes:
                     available_sizes.append(size_label)
 
+    # Format 2: sizes[] at root level (app API)
+    for size_info in data.get("sizes", product.get("sizes", [])):
+        size_label = (size_info.get("name") or size_info.get("label") or "").strip()
+        if not size_label or size_label in all_sizes:
+            continue
+        all_sizes.append(size_label)
+        avail = size_info.get("availability", size_info.get("stock", ""))
+        if str(avail).upper() in ("IN_STOCK", "BACK_IN_STOCK", "LOW_ON_STOCK", "TRUE", "1"):
+            if size_label not in available_sizes:
+                available_sizes.append(size_label)
+
     if not all_sizes:
-        logger.info("Inditex API returned no sizes, falling back to HTML scraper.")
-        return _scrape_inditex_html(session, url.split("?")[0])
+        return ScrapeResult(product_name=product_name,
+                            error="Размеры не найдены в ответе API. Введи вручную.")
 
-    return ScrapeResult(
-        product_name=product_name,
-        available_sizes=available_sizes,
-        all_sizes=all_sizes,
+    return ScrapeResult(product_name=product_name,
+                        all_sizes=all_sizes,
+                        available_sizes=available_sizes)
+
+
+def _scrape_inditex_html(url: str) -> ScrapeResult:
+    """
+    Last-resort HTML scraper for Inditex sites.
+    Tries mobile User-Agent which sometimes bypasses Cloudflare.
+    """
+    mobile_ua = (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
     )
-
-
-def _scrape_inditex_html(session: requests.Session, url: str) -> ScrapeResult:
-    """
-    Extract product data directly from the Zara/Massimo page HTML.
-    Zara embeds full product JSON in a <script> tag as window.zara.serverData
-    or in a <script type="application/json"> block.
-    """
     try:
-        resp = session.get(url, timeout=TIMEOUT)
-        resp.raise_for_status()
+        resp = _fetch_url(url, {**HEADERS, "User-Agent": mobile_ua})
+        if not resp:
+            raise ValueError("HTTP error")
         html = resp.text
-    except Exception as e:
-        return ScrapeResult(error=f"Не удалось загрузить страницу: {e}")
+    except Exception:
+        return ScrapeResult(
+            error=(
+                "Сайт блокирует автоматические запросы. "
+                "Введи размер вручную — бот сохранит товар и будет проверять наличие каждый час."
+            )
+        )
 
-    product_name = _extract_og_title(html) or "Товар"
+    product_name = _clean_name(_extract_og_title(html) or "")
     all_sizes: list = []
     available_sizes: list = []
 
@@ -276,7 +348,7 @@ def _scrape_generic(url: str) -> ScrapeResult:
     except Exception as e:
         return ScrapeResult(error=f"Не удалось загрузить страницу: {e}")
 
-    product_name = _extract_og_title(html) or "Товар"
+    product_name = _clean_name(_extract_og_title(html) or "")
 
     # Try JSON-LD
     result = _parse_jsonld(html, product_name)
@@ -299,10 +371,10 @@ def _extract_og_title(html: str) -> Optional[str]:
     if not m:
         m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']', html, re.I)
     if m:
-        return html_module.unescape(m.group(1)).strip()
+        return _clean_name(m.group(1))
     m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.I)
     if m:
-        return html_module.unescape(m.group(1)).strip()
+        return _clean_name(m.group(1))
     return None
 
 
