@@ -16,6 +16,7 @@ import re
 import json
 import logging
 import urllib.parse
+import html as html_module
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -54,39 +55,92 @@ class ScrapeResult:
 # ─────────────────────────────────────────────
 
 def _inditex_product_id(url: str) -> Optional[str]:
-    """Extract product ID from Inditex URL  e.g. ...p12345678.html → 12345678"""
+    """Extract product ID from Inditex URL.
+    Zara uses    -p12345678.html  (prefix p)
+    Massimo uses -l05724300       (prefix l)
+    """
+    # Try standard Zara pattern first
     m = re.search(r'-p(\d{8,})', url)
+    if m:
+        return m.group(1)
+    # Massimo Dutti uses letter l before ID
+    m = re.search(r'-l(\d{7,})', url)
+    if m:
+        return m.group(1)
+    # Try query param pelement= (Massimo Dutti sometimes uses this)
+    m = re.search(r'pelement=(\d+)', url)
     if m:
         return m.group(1)
     return None
 
 
+# All Inditex-family domains (same API structure)
+INDITEX_DOMAINS = {
+    "zara.com":          "www.zara.com",
+    "massimodutti.com":  "www.massimodutti.com",
+    "bershka.com":       "www.bershka.com",
+    "pullandbear.com":   "www.pullandbear.com",
+    "stradivarius.com":  "www.stradivarius.com",
+    "oysho.com":         "www.oysho.com",
+    "zarahome.com":      "www.zarahome.com",
+}
+
+# Country code → language override (for countries where lang ≠ country code)
+COUNTRY_LANG_OVERRIDE = {
+    "GB": "en",
+    "US": "en",
+    "AU": "en",
+    "CA": "en",
+    "IE": "en",
+    "NZ": "en",
+    "SG": "en",
+    "HK": "zh",
+    "TW": "zh",
+    "BE": "fr",
+    "CH": "de",
+}
+
+
+def _inditex_domain(url: str) -> str:
+    """Return the canonical domain for this Inditex brand URL."""
+    parsed = urllib.parse.urlparse(url)
+    netloc = parsed.netloc.lower().lstrip("www.")
+    for key, domain in INDITEX_DOMAINS.items():
+        if key in netloc:
+            return domain
+    return parsed.netloc  # fallback
+
+
 def _inditex_country_locale(url: str) -> tuple[str, str]:
-    """Guess country/locale from URL path like /ru/ru/ or /es/es/."""
-    m = re.search(r'zara\.com/([a-z]{2})/([a-z]{2})', url)
+    """Guess country/locale from any Inditex URL pattern."""
+    # Build a combined brand pattern
+    brand_pat = r'(?:' + '|'.join(re.escape(k) for k in INDITEX_DOMAINS) + r')'
+
+    # Two-segment path: /ru/ru/, /es/es/, /us/en/
+    m = re.search(brand_pat + r'/([a-z]{2})/([a-z]{2})(?:/|$)', url)
     if m:
-        return m.group(1).upper(), f"{m.group(2)}_{m.group(1).upper()}"
-    m = re.search(r'massimodutti\.com/([a-z]{2})/([a-z]{2})', url)
+        country = m.group(1).upper()
+        lang = m.group(2)
+        return country, f"{lang}_{country}"
+
+    # Single-segment: /pl/, /de/, /gb/
+    m = re.search(brand_pat + r'/([a-z]{2})(?:/|$|\?)', url)
     if m:
-        return m.group(1).upper(), f"{m.group(2)}_{m.group(1).upper()}"
+        country = m.group(1).upper()
+        lang = COUNTRY_LANG_OVERRIDE.get(country, country.lower())
+        return country, f"{lang}_{country}"
+
     return "RU", "ru_RU"
 
 
 def scrape_inditex(url: str) -> ScrapeResult:
-    """Fetch product data via Inditex internal JSON API."""
+    """Fetch product data via Inditex internal JSON API (works for all Inditex brands)."""
     product_id = _inditex_product_id(url)
     if not product_id:
-        return ScrapeResult(error="Не удалось найти ID товара в ссылке Zara/Massimo.")
+        return ScrapeResult(error="Не удалось найти ID товара в ссылке.")
 
     country, locale = _inditex_country_locale(url)
-
-    # Determine brand domain
-    if "massimodutti" in url:
-        brand_id = 3   # Massimo Dutti brand code in Inditex
-        domain = "www.massimodutti.com"
-    else:
-        brand_id = 1   # Zara
-        domain = "www.zara.com"
+    domain = _inditex_domain(url)
 
     api_url = (
         f"https://{domain}/itxrest/3/catalog/store/{country}/{locale}/"
@@ -101,7 +155,7 @@ def scrape_inditex(url: str) -> ScrapeResult:
         logger.warning(f"Inditex API failed ({api_url}): {e}")
         return _scrape_generic(url)  # fallback
 
-    product_name = data.get("name", "Товар")
+    product_name = html_module.unescape(data.get("name", "Товар")).strip()
 
     all_sizes = []
     available_sizes = []
@@ -168,12 +222,15 @@ def _scrape_generic(url: str) -> ScrapeResult:
 
 
 def _extract_og_title(html: str) -> Optional[str]:
+    # Try og:title (order of attributes can vary)
     m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+    if not m:
+        m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']', html, re.I)
     if m:
-        return m.group(1).strip()
+        return html_module.unescape(m.group(1)).strip()
     m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.I)
     if m:
-        return m.group(1).strip()
+        return html_module.unescape(m.group(1)).strip()
     return None
 
 
@@ -298,12 +355,16 @@ def check_product(url: str) -> ScrapeResult:
     """
     Main function — choose the right scraper based on URL domain.
     Returns a ScrapeResult with product info and size availability.
+
+    Inditex brands (API):  Zara, Massimo Dutti, Bershka, Pull&Bear,
+                           Stradivarius, Oysho, Zara Home
+    Generic (HTML):        Loewe, Toteme, Arket, COS, NET-A-PORTER,
+                           Farfetch, SSENSE, and everything else
     """
     parsed = urllib.parse.urlparse(url)
-    domain = parsed.netloc.lower()
+    netloc = parsed.netloc.lower()
 
-    if "zara.com" in domain or "massimodutti.com" in domain:
+    if any(brand in netloc for brand in INDITEX_DOMAINS):
         return scrape_inditex(url)
     else:
-        # Generic: works for Loewe, Toteme, Arket, COS, etc.
         return _scrape_generic(url)
