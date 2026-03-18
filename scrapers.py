@@ -142,18 +142,38 @@ def scrape_inditex(url: str) -> ScrapeResult:
     country, locale = _inditex_country_locale(url)
     domain = _inditex_domain(url)
 
+    # Use a session: first visit the product page to get cookies,
+    # then call the API — this bypasses 403 anti-bot blocks
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    # Step 1: load the product page to pick up cookies
+    clean_url = url.split("?")[0]  # strip UTM params
+    try:
+        session.get(clean_url, timeout=TIMEOUT, allow_redirects=True)
+    except Exception:
+        pass  # cookies not critical, continue anyway
+
+    # Step 2: call the internal API with cookies + JSON Accept header
     api_url = (
         f"https://{domain}/itxrest/3/catalog/store/{country}/{locale}/"
         f"product/{product_id}/detail"
     )
+    api_headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Referer": clean_url,
+        "Origin": f"https://{domain}",
+        "X-Requested-With": "XMLHttpRequest",
+    }
 
     try:
-        resp = requests.get(api_url, headers=HEADERS, timeout=TIMEOUT)
+        resp = session.get(api_url, headers=api_headers, timeout=TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         logger.warning(f"Inditex API failed ({api_url}): {e}")
-        return _scrape_generic(url)  # fallback
+        # Fallback: try to extract data from embedded page JSON
+        return _scrape_inditex_html(session, clean_url)
 
     product_name = html_module.unescape(data.get("name", "Товар")).strip()
 
@@ -176,13 +196,65 @@ def scrape_inditex(url: str) -> ScrapeResult:
 
     if not all_sizes:
         logger.info("Inditex API returned no sizes, falling back to HTML scraper.")
-        return _scrape_generic(url)
+        return _scrape_inditex_html(session, url.split("?")[0])
 
     return ScrapeResult(
         product_name=product_name,
         available_sizes=available_sizes,
         all_sizes=all_sizes,
     )
+
+
+def _scrape_inditex_html(session: requests.Session, url: str) -> ScrapeResult:
+    """
+    Extract product data directly from the Zara/Massimo page HTML.
+    Zara embeds full product JSON in a <script> tag as window.zara.serverData
+    or in a <script type="application/json"> block.
+    """
+    try:
+        resp = session.get(url, timeout=TIMEOUT)
+        resp.raise_for_status()
+        html = resp.text
+    except Exception as e:
+        return ScrapeResult(error=f"Не удалось загрузить страницу: {e}")
+
+    product_name = _extract_og_title(html) or "Товар"
+    all_sizes: list = []
+    available_sizes: list = []
+
+    # Zara stores product data in a large JSON inside <script> tags
+    # Look for any JSON blob containing "availability" + "name" fields
+    for script_content in re.findall(r'<script[^>]*>(.*?)</script>', html, re.S):
+        if '"availability"' not in script_content:
+            continue
+        # Try to find JSON objects with size data
+        for blob in re.findall(r'\{[^{}]{20,}\}', script_content):
+            try:
+                obj = json.loads(blob)
+            except Exception:
+                continue
+            name_val = obj.get("name", "")
+            avail_val = obj.get("availability", "")
+            if name_val and avail_val and len(str(name_val)) <= 10:
+                sz = str(name_val).strip()
+                if sz not in all_sizes:
+                    all_sizes.append(sz)
+                if avail_val in ("IN_STOCK", "BACK_IN_STOCK", "LOW_ON_STOCK"):
+                    if sz not in available_sizes:
+                        available_sizes.append(sz)
+
+    if all_sizes:
+        return ScrapeResult(
+            product_name=product_name,
+            all_sizes=all_sizes,
+            available_sizes=available_sizes,
+        )
+
+    # Last resort: full generic parse
+    result = _parse_jsonld(html, product_name)
+    if result.all_sizes:
+        return result
+    return _parse_size_keywords(html, product_name)
 
 
 # ─────────────────────────────────────────────
